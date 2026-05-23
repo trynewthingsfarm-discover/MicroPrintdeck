@@ -2,7 +2,7 @@ import { useState, useCallback, useRef } from 'react';
 import { Sparkles, Upload, X, ChevronRight, Layers, Star, Wand2, AlertCircle } from 'lucide-react';
 import type { Deck, DeckType, AppPage } from '../types';
 import { getCardsForDeckType } from '../lib/deckData';
-import { buildCardImageUrl, buildBackImageUrl, buildBoxImageUrl } from '../lib/pollinations';
+import { buildCardImageUrl, buildBackImageUrl, buildBoxImageUrl, buildLeadMagnetImageUrl, preloadImage } from '../lib/pollinations';
 import { supabase } from '../lib/supabase';
 
 interface DeckBuilderProps {
@@ -89,9 +89,10 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
       })),
     };
 
-    // Generate back and box images
+    // Generate back and box images with lead magnet
     deck.back_image_url = buildBackImageUrl(enhancedStyle, deckType, seed);
     deck.box_image_url = buildBoxImageUrl(enhancedStyle, deckType, seed);
+    deck.lead_magnet_image_url = buildLeadMagnetImageUrl(enhancedStyle, deckType, seed);
 
     // Save to Supabase
     try {
@@ -135,13 +136,37 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
       // Non-fatal — deck still works in memory
     }
 
-    // "Generate" in batches: actually just preload images and track progress
-    const BATCH = 6;
+    // Actually generate images by preloading them (Pollinations creates on first request)
+    const BATCH = 8;
     let loaded = 0;
     const total = cards.length;
+    const totalWithExtras = total + 3; // + back + box + lead magnet
 
     setProgressLabel(`Generating ${name}...`);
 
+    // First, preload back, box, and lead magnet images
+    setProgressLabel('Generating card back design...');
+    if (deck.back_image_url) {
+      await preloadImage(deck.back_image_url);
+    }
+    loaded++;
+    setProgress(Math.floor((loaded / totalWithExtras) * 100));
+
+    setProgressLabel('Generating box art...');
+    if (deck.box_image_url) {
+      await preloadImage(deck.box_image_url);
+    }
+    loaded++;
+    setProgress(Math.floor((loaded / totalWithExtras) * 100));
+
+    setProgressLabel('Generating lead magnet image...');
+    if (deck.lead_magnet_image_url) {
+      await preloadImage(deck.lead_magnet_image_url);
+    }
+    loaded++;
+    setProgress(Math.floor((loaded / totalWithExtras) * 100));
+
+    // Now preload all card fronts in batches
     for (let i = 0; i < total; i += BATCH) {
       if (cancelRef.current) break;
       const batch = deck.cards.slice(i, i + BATCH);
@@ -150,8 +175,11 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
         if (cancelRef.current) return;
         card.status = 'generating';
 
-        // Pollinations generates on first image load — just set the URL
-        // Mark as done immediately (URL is deterministic)
+        // Actually request the image from Pollinations
+        if (card.front_image_url) {
+          await preloadImage(card.front_image_url);
+        }
+
         card.status = 'done';
         loaded++;
 
@@ -160,18 +188,18 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
           setPreviewCards(prev => [...prev.slice(0, 5), card.front_image_url]);
         }
 
-        setProgress(Math.floor((loaded / total) * 100));
-        setProgressLabel(`Queued ${loaded} of ${total} cards for generation...`);
-        deck.generated_count = loaded;
+        setProgress(Math.floor((loaded / totalWithExtras) * 100));
+        setProgressLabel(`Generated ${loaded - 3} of ${total} cards...`);
+        deck.generated_count = loaded - 3;
 
         // Update Supabase progress
-        if (deck.id && loaded % 10 === 0) {
-          supabase.from('decks').update({ generated_count: loaded }).eq('id', deck.id).then(() => {});
+        if (deck.id && loaded % 12 === 0) {
+          supabase.from('decks').update({ generated_count: loaded - 3 }).eq('id', deck.id).then(() => {});
         }
       }));
 
       // Small delay between batches so UI feels responsive
-      await new Promise(r => setTimeout(r, 80));
+      await new Promise(r => setTimeout(r, 50));
     }
 
     if (!cancelRef.current) {
