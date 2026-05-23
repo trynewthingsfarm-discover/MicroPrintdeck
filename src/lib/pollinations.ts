@@ -142,13 +142,29 @@ Download your deck and hold art in your hand.`;
   }
 }
 
-// Preload image to warm cache
+// Preload image to warm cache with timeout
 export function preloadImage(url: string): Promise<void> {
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
-    img.onload = () => resolve();
-    img.onerror = () => resolve();
+
+    // Timeout after 45 seconds per image
+    const timeout = setTimeout(() => {
+      console.warn('Image load timeout:', url.slice(0, 80));
+      resolve();
+    }, 45000);
+
+    img.onload = () => {
+      clearTimeout(timeout);
+      resolve();
+    };
+
+    img.onerror = (err) => {
+      clearTimeout(timeout);
+      console.warn('Image load error:', url.slice(0, 80), err);
+      resolve();
+    };
+
     img.src = url;
   });
 }

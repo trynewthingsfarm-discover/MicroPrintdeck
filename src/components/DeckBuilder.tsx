@@ -97,7 +97,9 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
     // Save to Supabase
     try {
       const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
+      if (!user) {
+        console.error('No authenticated user — deck will work in memory only');
+      } else {
         const { data: savedDeck, error: deckErr } = await supabase
           .from('decks')
           .insert({
@@ -116,28 +118,34 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
           .select()
           .single();
 
-        if (!deckErr && savedDeck) {
+        if (deckErr) {
+          console.error('Failed to save deck:', deckErr);
+        } else if (savedDeck) {
           deck.id = savedDeck.id;
 
-          // Insert cards
-          const cardRows = deck.cards.map(c => ({
-            deck_id: savedDeck.id,
-            card_index: c.card_index,
-            card_key: c.card_key,
-            card_name: c.card_name,
-            card_suit: c.card_suit || null,
-            front_image_url: c.front_image_url,
-            seed: c.seed,
-          }));
-          await supabase.from('deck_cards').insert(cardRows);
+          // Insert cards in batches to avoid payload limits
+          const CARD_BATCH = 20;
+          for (let i = 0; i < deck.cards.length; i += CARD_BATCH) {
+            const cardBatch = deck.cards.slice(i, i + CARD_BATCH).map(c => ({
+              deck_id: savedDeck.id,
+              card_index: c.card_index,
+              card_key: c.card_key,
+              card_name: c.card_name,
+              card_suit: c.card_suit || null,
+              front_image_url: c.front_image_url,
+              seed: c.seed,
+            }));
+            const { error: cardErr } = await supabase.from('deck_cards').insert(cardBatch);
+            if (cardErr) console.error('Failed to save some cards:', cardErr);
+          }
         }
       }
-    } catch {
-      // Non-fatal — deck still works in memory
+    } catch (err) {
+      console.error('Supabase save error:', err);
     }
 
     // Actually generate images by preloading them (Pollinations creates on first request)
-    const BATCH = 8;
+    const BATCH = 6;
     let loaded = 0;
     const total = cards.length;
     const totalWithExtras = total + 3; // + back + box + lead magnet
@@ -145,33 +153,37 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
     setProgressLabel(`Generating ${name}...`);
 
     // First, preload back, box, and lead magnet images
-    setProgressLabel('Generating card back design...');
-    if (deck.back_image_url) {
-      await preloadImage(deck.back_image_url);
-    }
-    loaded++;
-    setProgress(Math.floor((loaded / totalWithExtras) * 100));
+    try {
+      setProgressLabel('Generating card back design...');
+      if (deck.back_image_url) {
+        await preloadImage(deck.back_image_url);
+      }
+      loaded++;
+      setProgress(Math.floor((loaded / totalWithExtras) * 100));
 
-    setProgressLabel('Generating box art...');
-    if (deck.box_image_url) {
-      await preloadImage(deck.box_image_url);
-    }
-    loaded++;
-    setProgress(Math.floor((loaded / totalWithExtras) * 100));
+      setProgressLabel('Generating box art...');
+      if (deck.box_image_url) {
+        await preloadImage(deck.box_image_url);
+      }
+      loaded++;
+      setProgress(Math.floor((loaded / totalWithExtras) * 100));
 
-    setProgressLabel('Generating lead magnet image...');
-    if (deck.lead_magnet_image_url) {
-      await preloadImage(deck.lead_magnet_image_url);
+      setProgressLabel('Generating lead magnet image...');
+      if (deck.lead_magnet_image_url) {
+        await preloadImage(deck.lead_magnet_image_url);
+      }
+      loaded++;
+      setProgress(Math.floor((loaded / totalWithExtras) * 100));
+    } catch (err) {
+      console.error('Error generating extras:', err);
     }
-    loaded++;
-    setProgress(Math.floor((loaded / totalWithExtras) * 100));
 
     // Now preload all card fronts in batches
     for (let i = 0; i < total; i += BATCH) {
       if (cancelRef.current) break;
       const batch = deck.cards.slice(i, i + BATCH);
 
-      await Promise.all(batch.map(async (card) => {
+      const results = await Promise.allSettled(batch.map(async (card) => {
         if (cancelRef.current) return;
         card.status = 'generating';
 
@@ -198,8 +210,21 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
         }
       }));
 
+      // Log any failed batches but continue
+      results.forEach((result, idx) => {
+        if (result.status === 'rejected') {
+          console.error('Batch item failed:', result.reason);
+          // Still mark as done to keep progress moving
+          loaded++;
+          const card = batch[idx];
+          if (card) card.status = 'done';
+        }
+      });
+
       // Small delay between batches so UI feels responsive
-      await new Promise(r => setTimeout(r, 50));
+      if (!cancelRef.current) {
+        await new Promise(r => setTimeout(r, 30));
+      }
     }
 
     if (!cancelRef.current) {
