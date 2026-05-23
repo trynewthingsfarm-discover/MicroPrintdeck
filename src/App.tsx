@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ensureAnonymousSession } from './lib/supabase';
+import { ensureGuestSession } from './lib/supabase';
 import type { Deck, AppPage } from './types';
 import Navigation from './components/Navigation';
 import Landing from './components/Landing';
@@ -15,7 +15,7 @@ export default function App() {
   const [isReady, setIsReady] = useState(false);
 
   useEffect(() => {
-    ensureAnonymousSession().then(() => setIsReady(true));
+    ensureGuestSession().then(() => setIsReady(true));
   }, []);
 
   if (!isReady) {
