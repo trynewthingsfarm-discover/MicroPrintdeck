@@ -2,8 +2,7 @@ import { useState, useCallback, useRef } from 'react';
 import { Sparkles, Upload, X, ChevronRight, Layers, Star, Wand2, AlertCircle } from 'lucide-react';
 import type { Deck, DeckType, AppPage } from '../types';
 import { getCardsForDeckType } from '../lib/deckData';
-import { buildFaceCardImageUrl, buildCardBackImageUrl, buildBoxImageUrl, buildLeadMagnetImageUrl, preloadImage } from '../lib/realdeck';
-import { generatePlayingCardSVG, generateCardBackSVG, svgToDataURL } from '../lib/cardRenderer';
+import { buildCardImageUrl, buildBackImageUrl, buildBoxImageUrl, buildLeadMagnetImageUrl, preloadImage } from '../lib/realdeck';
 import { supabase } from '../lib/supabase';
 
 interface DeckBuilderProps {
@@ -70,10 +69,10 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
       ? `${stylePrompt.trim()}, reference visual style from provided image`
       : stylePrompt.trim();
 
-    // For playing cards: generate SVG for number cards instantly, AI only for face cards
-    setProgressLabel('Generating cards...');
-    setProgress(5);
+    setProgressLabel('Preparing deck...');
+    setProgress(3);
 
+    // Create deck with AI art URLs
     const deck: Deck = {
       name,
       deck_type: deckType,
@@ -83,69 +82,26 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
       seed,
       total_cards: cards.length,
       generated_count: 0,
-      cards: cards.map((card, idx) => {
-        // Generate proper SVG for playing cards
-        let frontUrl = '';
-
-        if (deckType === 'playing') {
-          // For playing cards: use SVG generation
-          const suit = card.suit as 'spades' | 'hearts' | 'diamonds' | 'clubs';
-          const rank = card.value === 'ace' ? 'A'
-            : card.value === 'jack' ? 'J'
-            : card.value === 'queen' ? 'Q'
-            : card.value === 'king' ? 'K'
-            : card.value === 'joker' ? 'JOKER'
-            : card.value?.toUpperCase() || 'A';
-
-          // Generate SVG for this card
-          const svg = generatePlayingCardSVG(rank, suit, {
-            showCenterArt: ['J', 'Q', 'K', 'A'].includes(rank),
-          });
-
-          // For face cards, also create AI art URL (will be overlaid later)
-          const aiArtUrl = buildFaceCardImageUrl(card, enhancedStyle, seed);
-
-          // Use SVG data URL as the primary image (instant)
-          frontUrl = svgToDataURL(svg);
-
-          // Store AI URL for face cards (will overlay on print)
-          if (aiArtUrl && ['jack', 'queen', 'king'].includes(card.value || '')) {
-            // We'll store both and use AI art overlay in PDF
-          }
-        } else {
-          // For tarot, still use AI generation (slower but more artistic)
-          frontUrl = buildFaceCardImageUrl(card, enhancedStyle, seed);
-        }
-
-        return {
-          card_index: idx,
-          card_key: card.key,
-          card_name: card.name,
-          card_suit: card.suit,
-          front_image_url: frontUrl,
-          seed: seed + idx,
-          status: 'done' as const,
-        };
-      }),
+      cards: cards.map((card, idx) => ({
+        card_index: idx,
+        card_key: card.key,
+        card_name: card.name,
+        card_suit: card.suit,
+        front_image_url: buildCardImageUrl(card, enhancedStyle, deckType, seed + idx),
+        seed: seed + idx,
+        status: 'pending' as const,
+      })),
     };
 
-    // Generate back SVG (instant)
-    const backSvg = generateCardBackSVG('ornate');
-    deck.back_image_url = svgToDataURL(backSvg);
-
-    // Generate box and lead magnet with AI (these are optional/parallel)
-    deck.box_image_url = buildBoxImageUrl(enhancedStyle, seed);
-    deck.lead_magnet_image_url = buildLeadMagnetImageUrl(enhancedStyle, seed);
-
-    setProgressLabel('Cards generated!');
-    setProgress(100);
+    deck.back_image_url = buildBackImageUrl(enhancedStyle, deckType, seed);
+    deck.box_image_url = buildBoxImageUrl(enhancedStyle, deckType, seed);
+    deck.lead_magnet_image_url = buildLeadMagnetImageUrl(enhancedStyle, deckType, seed);
 
     // Save to Supabase
+    let deckId: string | undefined;
     try {
       const { data: { user } } = await supabase.auth.getUser();
-      if (!user) {
-        console.error('No authenticated user — deck will work in memory only');
-      } else {
+      if (user) {
         const { data: savedDeck, error: deckErr } = await supabase
           .from('decks')
           .insert({
@@ -159,65 +115,104 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
             status: 'generating',
             seed: deck.seed,
             total_cards: deck.total_cards,
-            generated_count: deck.total_cards,
+            generated_count: 0,
           })
           .select()
           .single();
 
-        if (deckErr) {
-          console.error('Failed to save deck:', deckErr);
-        } else if (savedDeck) {
-          deck.id = savedDeck.id;
+        if (!deckErr && savedDeck) {
+          deckId = savedDeck.id;
+          deck.id = deckId;
 
-          // Insert cards
-          const cardRows = deck.cards.map(c => ({
-            deck_id: savedDeck.id,
-            card_index: c.card_index,
-            card_key: c.card_key,
-            card_name: c.card_name,
-            card_suit: c.card_suit || null,
-            front_image_url: c.front_image_url,
-            seed: c.seed,
-          }));
-          const { error: cardErr } = await supabase.from('deck_cards').insert(cardRows);
-          if (cardErr) console.error('Failed to save cards:', cardErr);
-
-          // Update status
-          await supabase.from('decks').update({ status: 'complete' }).eq('id', savedDeck.id);
+          // Insert cards in batches
+          const BATCH_SIZE = 20;
+          for (let i = 0; i < deck.cards.length; i += BATCH_SIZE) {
+            const batch = deck.cards.slice(i, i + BATCH_SIZE).map(c => ({
+              deck_id: deckId,
+              card_index: c.card_index,
+              card_key: c.card_key,
+              card_name: c.card_name,
+              card_suit: c.card_suit || null,
+              front_image_url: c.front_image_url,
+              seed: c.seed,
+            }));
+            await supabase.from('deck_cards').insert(batch);
+          }
         }
       }
     } catch (err) {
-      console.error('Supabase save error:', err);
+      console.error('Supabase error:', err);
     }
 
-    // Preload AI images in background (non-blocking)
-    const faceCardDefs = deck.cards.filter(c => {
-      const value = c.card_key.split('_')[0];
-      return ['jack', 'queen', 'king'].includes(value);
-    });
+    // Generate images
+    const total = cards.length + 3;
+    let loaded = 0;
 
-    const aiImages = [
-      deck.box_image_url,
-      deck.lead_magnet_image_url,
-      ...faceCardDefs.map(c => {
-        const value = c.card_key.split('_')[0];
-        return buildFaceCardImageUrl({
-          key: c.card_key,
-          name: c.card_name,
-          suit: c.card_suit,
-          value,
-        }, enhancedStyle, c.seed);
-      }),
-    ].filter(Boolean);
+    // Card back
+    setProgressLabel('Generating card back...');
+    await preloadImage(deck.back_image_url!).catch(() => {});
+    loaded++;
+    setProgress(Math.floor((loaded / total) * 100));
+    setPreviewCards([deck.back_image_url!]);
 
-    // Fire and forget - don't wait for these
-    Promise.all(aiImages.map(url => preloadImage(url!))).catch(() => {});
+    // Box
+    setProgressLabel('Generating box art...');
+    await preloadImage(deck.box_image_url!).catch(() => {});
+    loaded++;
+    setProgress(Math.floor((loaded / total) * 100));
 
-    // Immediately mark as complete and navigate
-    deck.status = 'complete';
-    setIsGenerating(false);
-    onDeckCreated(deck);
-    onNavigate('gallery');
+    // Lead magnet
+    setProgressLabel('Generating showcase...');
+    await preloadImage(deck.lead_magnet_image_url!).catch(() => {});
+    loaded++;
+    setProgress(Math.floor((loaded / total) * 100));
+
+    // Cards in batches
+    const BATCH = 4;
+    for (let i = 0; i < deck.cards.length; i += BATCH) {
+      if (cancelRef.current) break;
+
+      const batch = deck.cards.slice(i, i + BATCH);
+      const cardNum = Math.min(i + BATCH, deck.cards.length);
+      setProgressLabel(`Generating cards ${i + 1}-${cardNum} of ${deck.cards.length}...`);
+
+      await Promise.allSettled(batch.map(async (card) => {
+        if (cancelRef.current) return;
+        card.status = 'generating';
+        await preloadImage(card.front_image_url!).catch(() => {});
+        card.status = 'done';
+        loaded++;
+        setProgress(Math.floor((loaded / total) * 100));
+      }));
+
+      // Update preview
+      const done = deck.cards.filter(c => c.status === 'done').slice(0, 6).map(c => c.front_image_url!);
+      setPreviewCards(done);
+
+      // Update DB
+      if (deckId && loaded % 8 === 0) {
+        supabase.from('decks').update({ generated_count: loaded - 3 }).eq('id', deckId).then(() => {});
+      }
+
+      if (!cancelRef.current) {
+        await new Promise(r => setTimeout(r, 30));
+      }
+    }
+
+    if (!cancelRef.current) {
+      deck.status = 'complete';
+      deck.cards.forEach(c => c.status = 'done');
+
+      if (deckId) {
+        await supabase.from('decks').update({ status: 'complete', generated_count: deck.cards.length }).eq('id', deckId);
+      }
+
+      setIsGenerating(false);
+      onDeckCreated(deck);
+      onNavigate('gallery');
+    } else {
+      setIsGenerating(false);
+    }
   };
 
   const canGenerate = deckType && stylePrompt.trim().length > 5;
@@ -232,46 +227,31 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
               <div
                 className="absolute inset-0 rounded-full border-2 border-amber-400 transition-all duration-300"
                 style={{
-                  background: `conic-gradient(#d97706 ${progress}%, transparent ${progress}%)`,
-                  borderColor: 'transparent',
+                  clipPath: `polygon(50% 0%, 100% 0%, 100% 100%, 0% 100%, 0% 0%, 50% 0%, 50% ${progress}%, ${progress}% ${progress}%)`,
+                  transform: 'rotate(-90deg)',
                 }}
               />
-              <div className="absolute inset-2 rounded-full bg-[#0a0a0f] flex items-center justify-center">
-                <Sparkles className="w-8 h-8 text-amber-400 animate-pulse" />
+              <div className="absolute inset-0 flex items-center justify-center">
+                <span className="text-xl font-bold text-amber-400">{progress}%</span>
               </div>
             </div>
-
-            <h2 className="text-2xl font-bold text-stone-100 mb-2">Crafting Your Deck</h2>
-            <p className="text-stone-500 text-sm">{progressLabel}</p>
+            <p className="text-neutral-400 text-sm">{progressLabel || 'Generating...'}</p>
+            {previewCards.length > 0 && (
+              <div className="flex justify-center gap-2 mt-6 flex-wrap">
+                {previewCards.slice(0, 4).map((url, i) => (
+                  <img
+                    key={i}
+                    src={url}
+                    alt={`Card preview ${i + 1}`}
+                    className="w-16 h-24 object-cover rounded border border-neutral-800"
+                  />
+                ))}
+              </div>
+            )}
           </div>
-
-          <div className="w-full bg-stone-800 rounded-full h-2 mb-6 overflow-hidden">
-            <div
-              className="h-full bg-gradient-to-r from-amber-600 to-amber-400 rounded-full transition-all duration-300"
-              style={{ width: `${progress}%` }}
-            />
-          </div>
-
-          <p className="text-amber-700 font-semibold text-lg mb-2">{progress}%</p>
-
-          {previewCards.length > 0 && (
-            <div className="flex gap-2 justify-center mt-6">
-              {previewCards.slice(0, 5).map((url, i) => (
-                <div key={i} className="w-12 h-16 rounded-md overflow-hidden border border-amber-800/30 bg-stone-900">
-                  <img src={url} alt="" className="w-full h-full object-cover" loading="lazy" />
-                </div>
-              ))}
-            </div>
-          )}
-
-          <p className="text-stone-700 text-xs mt-6 leading-relaxed">
-            AI is queuing {deckType === 'playing' ? '54' : '78'} unique cards.<br />
-            Cards render as you view them in the gallery.
-          </p>
-
           <button
             onClick={() => { cancelRef.current = true; }}
-            className="mt-8 text-stone-600 hover:text-stone-400 text-sm transition-colors"
+            className="px-6 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-lg text-sm transition-colors"
           >
             Cancel
           </button>
@@ -281,193 +261,152 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
   }
 
   return (
-    <div className="min-h-screen bg-[#0a0a0f] text-stone-100 pt-24 pb-20">
-      <div className="max-w-3xl mx-auto px-6">
-        {/* Header */}
-        <div className="mb-12">
-          <h1 className="text-4xl font-bold text-stone-100 mb-3">Build Your Deck</h1>
-          <p className="text-stone-500 text-lg">Choose your deck type, describe your vision, and let the AI do its work.</p>
-        </div>
+    <div className="min-h-screen bg-[#0a0a0f] py-12 px-6">
+      <div className="max-w-3xl mx-auto">
+        {!deckType ? (
+          <div className="text-center">
+            <h2 className="text-3xl font-light text-white mb-4 tracking-tight">Choose Your Deck</h2>
+            <p className="text-neutral-400 mb-10">What will you create?</p>
 
-        {error && (
-          <div className="mb-6 p-4 rounded-xl bg-red-950/30 border border-red-800/50 flex items-center gap-3">
-            <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0" />
-            <p className="text-red-300 text-sm">{error}</p>
-          </div>
-        )}
-
-        {/* Step 1: Deck Type */}
-        <div className="mb-10">
-          <div className="flex items-center gap-3 mb-5">
-            <div className="w-7 h-7 rounded-full bg-amber-500 flex items-center justify-center text-stone-950 font-bold text-xs">1</div>
-            <h2 className="text-lg font-semibold text-stone-200">Choose Your Deck Type</h2>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {([
-              {
-                type: 'playing' as DeckType,
-                label: 'Playing Card Deck',
-                count: '54 cards',
-                desc: 'Full deck of 52 cards plus 2 jokers. Four suits, face cards, aces. Classic pocket game deck with your custom art.',
-                icon: Layers,
-                detail: 'Spades · Hearts · Diamonds · Clubs',
-              },
-              {
-                type: 'tarot' as DeckType,
-                label: 'Tarot Deck',
-                count: '78 cards',
-                desc: 'Complete tarot with 22 Major Arcana and 56 Minor Arcana across Wands, Cups, Swords, and Pentacles.',
-                icon: Star,
-                detail: 'Major Arcana · 4 Minor Suits',
-              },
-            ] as const).map(({ type, label, count, desc, icon: Icon, detail }) => (
+            <div className="grid md:grid-cols-2 gap-6 max-w-xl mx-auto">
               <button
-                key={type}
-                onClick={() => setDeckType(type)}
-                className={`p-6 rounded-xl border-2 text-left transition-all duration-200 ${
-                  deckType === type
-                    ? 'border-amber-500 bg-amber-950/30 shadow-lg shadow-amber-900/20'
-                    : 'border-stone-800 bg-stone-900/30 hover:border-stone-700 hover:bg-stone-800/30'
-                }`}
+                onClick={() => setDeckType('playing')}
+                className="group relative p-8 bg-gradient-to-br from-neutral-900 to-neutral-950 rounded-2xl border border-neutral-800 hover:border-amber-600/50 transition-all text-left"
               >
-                <div className="flex items-start gap-4">
-                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0 ${deckType === type ? 'bg-amber-500/20 border border-amber-500/50' : 'bg-stone-800 border border-stone-700'}`}>
-                    <Icon className={`w-5 h-5 ${deckType === type ? 'text-amber-400' : 'text-stone-500'}`} />
-                  </div>
-                  <div>
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className="font-semibold text-stone-100">{label}</span>
-                      <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${deckType === type ? 'bg-amber-900/50 text-amber-300' : 'bg-stone-800 text-stone-500'}`}>{count}</span>
-                    </div>
-                    <p className="text-stone-500 text-sm leading-relaxed mb-2">{desc}</p>
-                    <p className={`text-xs font-medium ${deckType === type ? 'text-amber-600' : 'text-stone-700'}`}>{detail}</p>
+                <Layers className="w-8 h-8 text-amber-400 mb-4" />
+                <h3 className="text-xl font-medium text-white mb-2">Playing Cards</h3>
+                <p className="text-neutral-500 text-sm">54 cards — full deck with suits, pips, and courts</p>
+                <ChevronRight className="absolute right-6 top-1/2 -translate-y-1/2 w-5 h-5 text-neutral-600 group-hover:text-amber-400 transition-colors" />
+              </button>
+
+              <button
+                onClick={() => setDeckType('tarot')}
+                className="group relative p-8 bg-gradient-to-br from-neutral-900 to-neutral-950 rounded-2xl border border-neutral-800 hover:border-amber-600/50 transition-all text-left"
+              >
+                <Star className="w-8 h-8 text-amber-400 mb-4" />
+                <h3 className="text-xl font-medium text-white mb-2">Tarot Cards</h3>
+                <p className="text-neutral-500 text-sm">78 cards — Major and Minor Arcana</p>
+                <ChevronRight className="absolute right-6 top-1/2 -translate-y-1/2 w-5 h-5 text-neutral-600 group-hover:text-amber-400 transition-colors" />
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div>
+            <button
+              onClick={() => { setDeckType(null); setStylePrompt(''); setStyleImage(null); }}
+              className="flex items-center gap-2 text-neutral-500 hover:text-neutral-300 text-sm mb-8 transition-colors"
+            >
+              <X className="w-4 h-4" />
+              Change deck type
+            </button>
+
+            <div className="bg-gradient-to-br from-neutral-900 to-neutral-950 rounded-3xl border border-neutral-800 p-8">
+              <div className="flex items-center gap-3 mb-8">
+                {deckType === 'playing' ? (
+                  <Layers className="w-6 h-6 text-amber-400" />
+                ) : (
+                  <Star className="w-6 h-6 text-amber-400" />
+                )}
+                <h2 className="text-2xl font-light text-white tracking-tight">
+                  Create Your {deckType === 'playing' ? 'Playing' : 'Tarot'} Deck
+                </h2>
+              </div>
+
+              {error && (
+                <div className="mb-6 p-4 bg-red-900/20 border border-red-800/50 rounded-lg flex items-start gap-3">
+                  <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+                  <p className="text-red-300 text-sm">{error}</p>
+                </div>
+              )}
+
+              <div className="space-y-6">
+                <div>
+                  <label className="block text-sm font-medium text-neutral-300 mb-2">Deck Name (optional)</label>
+                  <input
+                    type="text"
+                    value={deckName}
+                    onChange={(e) => setDeckName(e.target.value)}
+                    placeholder={`My ${deckType === 'playing' ? 'Playing' : 'Tarot'} Deck`}
+                    className="w-full px-4 py-3 bg-neutral-800/50 border border-neutral-700 rounded-xl text-white placeholder:text-neutral-500 focus:outline-none focus:border-amber-600 transition-colors"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-neutral-300 mb-2">Visual Style</label>
+                  <textarea
+                    value={stylePrompt}
+                    onChange={(e) => setStylePrompt(e.target.value)}
+                    placeholder="Describe the artistic style for your deck..."
+                    rows={3}
+                    className="w-full px-4 py-3 bg-neutral-800/50 border border-neutral-700 rounded-xl text-white placeholder:text-neutral-500 focus:outline-none focus:border-amber-600 transition-colors resize-none"
+                  />
+                  <div className="flex flex-wrap gap-2 mt-3">
+                    {STYLE_EXAMPLES.slice(0, 4).map((ex, i) => (
+                      <button
+                        key={i}
+                        onClick={() => setStylePrompt(ex)}
+                        className="text-xs px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-200 rounded-full transition-colors"
+                      >
+                        {ex.split(',')[0]}
+                      </button>
+                    ))}
                   </div>
                 </div>
-              </button>
-            ))}
-          </div>
-        </div>
 
-        {/* Step 2: Deck Name */}
-        <div className="mb-10">
-          <div className="flex items-center gap-3 mb-5">
-            <div className={`w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs ${deckType ? 'bg-amber-500 text-stone-950' : 'bg-stone-800 text-stone-600'}`}>2</div>
-            <h2 className={`text-lg font-semibold ${deckType ? 'text-stone-200' : 'text-stone-700'}`}>Name Your Deck</h2>
-          </div>
-
-          <input
-            type="text"
-            value={deckName}
-            onChange={e => setDeckName(e.target.value)}
-            placeholder="e.g. Midnight Garden Tarot, Neon Noir Playing Cards..."
-            disabled={!deckType}
-            className="w-full px-4 py-3 rounded-xl bg-stone-900/60 border border-stone-800 text-stone-100 placeholder-stone-700 focus:outline-none focus:border-amber-700 disabled:opacity-40 transition-colors"
-          />
-        </div>
-
-        {/* Step 3: Style Prompt */}
-        <div className="mb-10">
-          <div className="flex items-center gap-3 mb-5">
-            <div className={`w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs ${deckType ? 'bg-amber-500 text-stone-950' : 'bg-stone-800 text-stone-600'}`}>3</div>
-            <h2 className={`text-lg font-semibold ${deckType ? 'text-stone-200' : 'text-stone-700'}`}>Describe Your Style</h2>
-          </div>
-
-          <div className="space-y-3">
-            <textarea
-              value={stylePrompt}
-              onChange={e => setStylePrompt(e.target.value)}
-              placeholder="Describe the art style, mood, color palette, influences, era, textures, vibes... The more specific, the better the results."
-              disabled={!deckType}
-              rows={4}
-              className="w-full px-4 py-3 rounded-xl bg-stone-900/60 border border-stone-800 text-stone-100 placeholder-stone-700 focus:outline-none focus:border-amber-700 disabled:opacity-40 transition-colors resize-none text-sm leading-relaxed"
-            />
-
-            {/* Style examples */}
-            <div>
-              <p className="text-xs text-stone-600 mb-2 font-medium uppercase tracking-wider">Quick starts — click to use</p>
-              <div className="flex flex-wrap gap-2">
-                {STYLE_EXAMPLES.slice(0, 6).map(ex => (
-                  <button
-                    key={ex}
-                    onClick={() => setStylePrompt(ex)}
-                    disabled={!deckType}
-                    className="text-xs px-3 py-1.5 rounded-lg border border-stone-800 text-stone-500 hover:text-amber-300 hover:border-amber-800/50 hover:bg-stone-800/50 transition-all disabled:opacity-30 text-left"
+                <div>
+                  <label className="block text-sm font-medium text-neutral-300 mb-2">Style Reference Image (optional)</label>
+                  <div
+                    onDrop={handleImageDrop}
+                    onDragOver={(e) => e.preventDefault()}
+                    onClick={() => fileInputRef.current?.click()}
+                    className="relative border-2 border-dashed border-neutral-700 hover:border-amber-600/50 rounded-xl p-6 text-center cursor-pointer transition-colors group"
                   >
-                    {ex.split(',')[0]}
-                  </button>
-                ))}
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="image/*"
+                      onChange={handleImageFile}
+                      className="hidden"
+                    />
+                    {styleImage ? (
+                      <div className="relative">
+                        <img
+                          src={styleImage}
+                          alt="Style reference"
+                          className="max-h-40 mx-auto rounded-lg"
+                        />
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setStyleImage(null); }}
+                          className="absolute -top-2 -right-2 w-6 h-6 bg-neutral-900 border border-neutral-700 rounded-full flex items-center justify-center text-neutral-400 hover:text-white transition-colors"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="text-neutral-500">
+                        <Upload className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                        <p className="text-sm">Drop an image or click to upload</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <button
+                  onClick={generateDeck}
+                  disabled={!canGenerate}
+                  className="w-full py-4 bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 disabled:from-neutral-700 disabled:to-neutral-700 text-black font-medium rounded-xl transition-all disabled:cursor-not-allowed flex items-center justify-center gap-3"
+                >
+                  <Wand2 className="w-5 h-5" />
+                  Generate Deck ({deckType === 'playing' ? 54 : 78} cards)
+                </button>
+
+                {!canGenerate && stylePrompt.trim().length > 0 && (
+                  <p className="text-xs text-neutral-500 text-center">Style description needs at least 6 characters</p>
+                )}
               </div>
             </div>
           </div>
-        </div>
-
-        {/* Step 4: Style Reference Image */}
-        <div className="mb-12">
-          <div className="flex items-center gap-3 mb-5">
-            <div className={`w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs ${deckType ? 'bg-amber-500 text-stone-950' : 'bg-stone-800 text-stone-600'}`}>4</div>
-            <div>
-              <h2 className={`text-lg font-semibold ${deckType ? 'text-stone-200' : 'text-stone-700'}`}>Style Reference Image</h2>
-              <span className="text-xs text-stone-600">Optional</span>
-            </div>
-          </div>
-
-          {styleImage ? (
-            <div className="relative inline-block">
-              <img src={styleImage} alt="Style reference" className="w-32 h-32 object-cover rounded-xl border border-amber-700/40" />
-              <button
-                onClick={() => setStyleImage(null)}
-                className="absolute -top-2 -right-2 w-6 h-6 bg-red-900 hover:bg-red-800 rounded-full flex items-center justify-center transition-colors"
-              >
-                <X className="w-3 h-3 text-red-200" />
-              </button>
-              <p className="mt-2 text-xs text-stone-600">Style inspiration applied</p>
-            </div>
-          ) : (
-            <div
-              onDrop={handleImageDrop}
-              onDragOver={e => e.preventDefault()}
-              onClick={() => fileInputRef.current?.click()}
-              className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all ${
-                deckType
-                  ? 'border-stone-700 hover:border-amber-700/60 hover:bg-stone-800/20'
-                  : 'border-stone-800 opacity-40'
-              }`}
-            >
-              <Upload className="w-8 h-8 text-stone-600 mx-auto mb-3" />
-              <p className="text-stone-500 text-sm">Drop an image or click to upload</p>
-              <p className="text-stone-700 text-xs mt-1">A painting, photo, or texture that captures the vibe you want</p>
-              <input ref={fileInputRef} type="file" accept="image/*" onChange={handleImageFile} className="hidden" />
-            </div>
-          )}
-        </div>
-
-        {/* Generate Button */}
-        <div className="flex flex-col items-center gap-4">
-          <button
-            onClick={generateDeck}
-            disabled={!canGenerate}
-            className={`group flex items-center gap-3 px-10 py-4 rounded-xl font-bold text-base transition-all duration-200 ${
-              canGenerate
-                ? 'bg-amber-500 hover:bg-amber-400 text-stone-950 shadow-lg shadow-amber-900/40 hover:shadow-amber-700/50 hover:scale-105'
-                : 'bg-stone-800 text-stone-600 cursor-not-allowed'
-            }`}
-          >
-            <Wand2 className="w-5 h-5" />
-            Generate {deckType === 'playing' ? '54-Card Playing' : deckType === 'tarot' ? '78-Card Tarot' : ''} Deck
-            <ChevronRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
-          </button>
-
-          {!canGenerate && (
-            <p className="text-stone-700 text-sm">
-              {!deckType ? 'Select a deck type to continue' : 'Add a style description to continue'}
-            </p>
-          )}
-
-          <p className="text-stone-700 text-xs text-center max-w-sm">
-            Cards are generated by free AI — each unique to your prompt. Generation queues all cards instantly, they render as you browse.
-          </p>
-        </div>
+        )}
       </div>
     </div>
   );
