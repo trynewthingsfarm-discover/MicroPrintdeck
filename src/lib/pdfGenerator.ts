@@ -1,6 +1,6 @@
 import jsPDFModule from 'jspdf';
 import type { Deck } from '../types';
-import { imageUrlToBase64 } from './pollinations';
+import { svgToCanvas } from './cardRenderer';
 
 const { jsPDF } = jsPDFModule;
 
@@ -33,6 +33,30 @@ const PRINT_H = PAGE_H - MARGIN * 2;
 const COLS = Math.floor((PRINT_W + GAP) / (CARD_W + GAP));
 const ROWS = Math.floor((PRINT_H + GAP) / (CARD_H + GAP));
 const PER_PAGE = COLS * ROWS;
+
+// Convert data URL (SVG or image) to base64 for PDF
+async function loadDataUrl(url: string): Promise<string> {
+  // If it's already a data URL, check if it's SVG
+  if (url.startsWith('data:image/svg+xml')) {
+    // SVG needs to be rendered to canvas first for PDF
+    const svg = decodeURIComponent(url.replace('data:image/svg+xml,', ''));
+    const canvas = await svgToCanvas(svg);
+    return canvas.toDataURL('image/jpeg', 0.95);
+  }
+  // If it's already base64 image, return as-is
+  if (url.startsWith('data:image')) {
+    return url;
+  }
+  // If it's a remote URL, fetch it
+  const res = await fetch(url);
+  const blob = await res.blob();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
 
 // Helper: Draw corner crop marks
 function drawCropMarks(doc: ReturnType<typeof jsPDF>, x: number, y: number, w: number, h: number) {
@@ -73,7 +97,7 @@ async function loadImages(urls: string[], onProgress?: (n: number) => void): Pro
   const results: (string | null)[] = [];
   for (let i = 0; i < urls.length; i++) {
     try {
-      results.push(await imageUrlToBase64(urls[i]));
+      results.push(await loadDataUrl(urls[i]));
     } catch {
       results.push(null);
     }
@@ -120,7 +144,7 @@ export async function generateFrontsPDF(deck: Deck, onProgress?: (n: number) => 
 
       // Load and embed image
       try {
-        const imgData = await imageUrlToBase64(card.front_image_url!);
+        const imgData = await loadDataUrl(card.front_image_url!);
         doc.addImage(imgData, 'JPEG', x, y, CARD_W, CARD_H, undefined, 'FAST');
       } catch {
         // Fallback: card name text
@@ -153,7 +177,7 @@ export async function generateBacksPDF(deck: Deck, onProgress?: (n: number) => v
   const totalPages = Math.ceil(total / PER_PAGE);
 
   // Load back image once
-  const backImg = await imageUrlToBase64(deck.back_image_url).catch(() => null);
+  const backImg = await loadDataUrl(deck.back_image_url).catch(() => null);
 
   for (let page = 0; page < totalPages; page++) {
     if (page > 0) doc.addPage();
@@ -231,7 +255,7 @@ export async function generateBoxPDF(deck: Deck): Promise<void> {
   doc.text('Cut solid lines · Score & fold dashed lines · Glue tabs where marked', LW / 2, 35, { align: 'center' });
 
   // Load box art
-  const boxImg = deck.box_image_url ? await imageUrlToBase64(deck.box_image_url).catch(() => null) : null;
+  const boxImg = deck.box_image_url ? await loadDataUrl(deck.box_image_url).catch(() => null) : null;
 
   // Panel layout (unfolded box net)
   // [Tuck Flap] [Front] [Bottom] [Back] [Top Closure]

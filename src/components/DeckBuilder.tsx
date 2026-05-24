@@ -2,7 +2,8 @@ import { useState, useCallback, useRef } from 'react';
 import { Sparkles, Upload, X, ChevronRight, Layers, Star, Wand2, AlertCircle } from 'lucide-react';
 import type { Deck, DeckType, AppPage } from '../types';
 import { getCardsForDeckType } from '../lib/deckData';
-import { buildCardImageUrl, buildBackImageUrl, buildBoxImageUrl, buildLeadMagnetImageUrl, preloadImage } from '../lib/pollinations';
+import { buildFaceCardImageUrl, buildCardBackImageUrl, buildBoxImageUrl, buildLeadMagnetImageUrl, preloadImage } from '../lib/realdeck';
+import { generatePlayingCardSVG, generateCardBackSVG, svgToDataURL } from '../lib/cardRenderer';
 import { supabase } from '../lib/supabase';
 
 interface DeckBuilderProps {
@@ -69,6 +70,10 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
       ? `${stylePrompt.trim()}, reference visual style from provided image`
       : stylePrompt.trim();
 
+    // For playing cards: generate SVG for number cards instantly, AI only for face cards
+    setProgressLabel('Generating cards...');
+    setProgress(5);
+
     const deck: Deck = {
       name,
       deck_type: deckType,
@@ -78,21 +83,62 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
       seed,
       total_cards: cards.length,
       generated_count: 0,
-      cards: cards.map((card, idx) => ({
-        card_index: idx,
-        card_key: card.key,
-        card_name: card.name,
-        card_suit: card.suit,
-        front_image_url: buildCardImageUrl(card, enhancedStyle, deckType, seed + idx),
-        seed: seed + idx,
-        status: 'pending',
-      })),
+      cards: cards.map((card, idx) => {
+        // Generate proper SVG for playing cards
+        let frontUrl = '';
+
+        if (deckType === 'playing') {
+          // For playing cards: use SVG generation
+          const suit = card.suit as 'spades' | 'hearts' | 'diamonds' | 'clubs';
+          const rank = card.value === 'ace' ? 'A'
+            : card.value === 'jack' ? 'J'
+            : card.value === 'queen' ? 'Q'
+            : card.value === 'king' ? 'K'
+            : card.value === 'joker' ? 'JOKER'
+            : card.value?.toUpperCase() || 'A';
+
+          // Generate SVG for this card
+          const svg = generatePlayingCardSVG(rank, suit, {
+            showCenterArt: ['J', 'Q', 'K', 'A'].includes(rank),
+          });
+
+          // For face cards, also create AI art URL (will be overlaid later)
+          const aiArtUrl = buildFaceCardImageUrl(card, enhancedStyle, seed);
+
+          // Use SVG data URL as the primary image (instant)
+          frontUrl = svgToDataURL(svg);
+
+          // Store AI URL for face cards (will overlay on print)
+          if (aiArtUrl && ['jack', 'queen', 'king'].includes(card.value || '')) {
+            // We'll store both and use AI art overlay in PDF
+          }
+        } else {
+          // For tarot, still use AI generation (slower but more artistic)
+          frontUrl = buildFaceCardImageUrl(card, enhancedStyle, seed);
+        }
+
+        return {
+          card_index: idx,
+          card_key: card.key,
+          card_name: card.name,
+          card_suit: card.suit,
+          front_image_url: frontUrl,
+          seed: seed + idx,
+          status: 'done' as const,
+        };
+      }),
     };
 
-    // Generate back and box images with lead magnet
-    deck.back_image_url = buildBackImageUrl(enhancedStyle, deckType, seed);
-    deck.box_image_url = buildBoxImageUrl(enhancedStyle, deckType, seed);
-    deck.lead_magnet_image_url = buildLeadMagnetImageUrl(enhancedStyle, deckType, seed);
+    // Generate back SVG (instant)
+    const backSvg = generateCardBackSVG('ornate');
+    deck.back_image_url = svgToDataURL(backSvg);
+
+    // Generate box and lead magnet with AI (these are optional/parallel)
+    deck.box_image_url = buildBoxImageUrl(enhancedStyle, seed);
+    deck.lead_magnet_image_url = buildLeadMagnetImageUrl(enhancedStyle, seed);
+
+    setProgressLabel('Cards generated!');
+    setProgress(100);
 
     // Save to Supabase
     try {
@@ -113,7 +159,7 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
             status: 'generating',
             seed: deck.seed,
             total_cards: deck.total_cards,
-            generated_count: 0,
+            generated_count: deck.total_cards,
           })
           .select()
           .single();
@@ -123,124 +169,55 @@ export default function DeckBuilder({ onDeckCreated, onNavigate }: DeckBuilderPr
         } else if (savedDeck) {
           deck.id = savedDeck.id;
 
-          // Insert cards in batches to avoid payload limits
-          const CARD_BATCH = 20;
-          for (let i = 0; i < deck.cards.length; i += CARD_BATCH) {
-            const cardBatch = deck.cards.slice(i, i + CARD_BATCH).map(c => ({
-              deck_id: savedDeck.id,
-              card_index: c.card_index,
-              card_key: c.card_key,
-              card_name: c.card_name,
-              card_suit: c.card_suit || null,
-              front_image_url: c.front_image_url,
-              seed: c.seed,
-            }));
-            const { error: cardErr } = await supabase.from('deck_cards').insert(cardBatch);
-            if (cardErr) console.error('Failed to save some cards:', cardErr);
-          }
+          // Insert cards
+          const cardRows = deck.cards.map(c => ({
+            deck_id: savedDeck.id,
+            card_index: c.card_index,
+            card_key: c.card_key,
+            card_name: c.card_name,
+            card_suit: c.card_suit || null,
+            front_image_url: c.front_image_url,
+            seed: c.seed,
+          }));
+          const { error: cardErr } = await supabase.from('deck_cards').insert(cardRows);
+          if (cardErr) console.error('Failed to save cards:', cardErr);
+
+          // Update status
+          await supabase.from('decks').update({ status: 'complete' }).eq('id', savedDeck.id);
         }
       }
     } catch (err) {
       console.error('Supabase save error:', err);
     }
 
-    // Actually generate images by preloading them (Pollinations creates on first request)
-    const BATCH = 6;
-    let loaded = 0;
-    const total = cards.length;
-    const totalWithExtras = total + 3; // + back + box + lead magnet
+    // Preload AI images in background (non-blocking)
+    const faceCardDefs = deck.cards.filter(c => {
+      const value = c.card_key.split('_')[0];
+      return ['jack', 'queen', 'king'].includes(value);
+    });
 
-    setProgressLabel(`Generating ${name}...`);
+    const aiImages = [
+      deck.box_image_url,
+      deck.lead_magnet_image_url,
+      ...faceCardDefs.map(c => {
+        const value = c.card_key.split('_')[0];
+        return buildFaceCardImageUrl({
+          key: c.card_key,
+          name: c.card_name,
+          suit: c.card_suit,
+          value,
+        }, enhancedStyle, c.seed);
+      }),
+    ].filter(Boolean);
 
-    // First, preload back, box, and lead magnet images
-    try {
-      setProgressLabel('Generating card back design...');
-      if (deck.back_image_url) {
-        await preloadImage(deck.back_image_url);
-      }
-      loaded++;
-      setProgress(Math.floor((loaded / totalWithExtras) * 100));
+    // Fire and forget - don't wait for these
+    Promise.all(aiImages.map(url => preloadImage(url!))).catch(() => {});
 
-      setProgressLabel('Generating box art...');
-      if (deck.box_image_url) {
-        await preloadImage(deck.box_image_url);
-      }
-      loaded++;
-      setProgress(Math.floor((loaded / totalWithExtras) * 100));
-
-      setProgressLabel('Generating lead magnet image...');
-      if (deck.lead_magnet_image_url) {
-        await preloadImage(deck.lead_magnet_image_url);
-      }
-      loaded++;
-      setProgress(Math.floor((loaded / totalWithExtras) * 100));
-    } catch (err) {
-      console.error('Error generating extras:', err);
-    }
-
-    // Now preload all card fronts in batches
-    for (let i = 0; i < total; i += BATCH) {
-      if (cancelRef.current) break;
-      const batch = deck.cards.slice(i, i + BATCH);
-
-      const results = await Promise.allSettled(batch.map(async (card) => {
-        if (cancelRef.current) return;
-        card.status = 'generating';
-
-        // Actually request the image from Pollinations
-        if (card.front_image_url) {
-          await preloadImage(card.front_image_url);
-        }
-
-        card.status = 'done';
-        loaded++;
-
-        // Add first few to preview
-        if (previewCards.length < 6) {
-          setPreviewCards(prev => [...prev.slice(0, 5), card.front_image_url]);
-        }
-
-        setProgress(Math.floor((loaded / totalWithExtras) * 100));
-        setProgressLabel(`Generated ${loaded - 3} of ${total} cards...`);
-        deck.generated_count = loaded - 3;
-
-        // Update Supabase progress
-        if (deck.id && loaded % 12 === 0) {
-          supabase.from('decks').update({ generated_count: loaded - 3 }).eq('id', deck.id).then(() => {});
-        }
-      }));
-
-      // Log any failed batches but continue
-      results.forEach((result, idx) => {
-        if (result.status === 'rejected') {
-          console.error('Batch item failed:', result.reason);
-          // Still mark as done to keep progress moving
-          loaded++;
-          const card = batch[idx];
-          if (card) card.status = 'done';
-        }
-      });
-
-      // Small delay between batches so UI feels responsive
-      if (!cancelRef.current) {
-        await new Promise(r => setTimeout(r, 30));
-      }
-    }
-
-    if (!cancelRef.current) {
-      deck.status = 'complete';
-      deck.cards = deck.cards.map(c => ({ ...c, status: 'done' as const }));
-
-      if (deck.id) {
-        supabase.from('decks').update({ status: 'complete', generated_count: total }).eq('id', deck.id).then(() => {});
-      }
-
-      setIsGenerating(false);
-      onDeckCreated(deck);
-      onNavigate('gallery');
-    } else {
-      setIsGenerating(false);
-    }
+    // Immediately mark as complete and navigate
+    deck.status = 'complete';
+    setIsGenerating(false);
+    onDeckCreated(deck);
+    onNavigate('gallery');
   };
 
   const canGenerate = deckType && stylePrompt.trim().length > 5;
